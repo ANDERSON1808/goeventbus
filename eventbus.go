@@ -5,7 +5,16 @@ import (
 	"errors"
 	"log"
 	"reflect"
+	"sort"
 	"sync"
+	"time"
+)
+
+// Constantes de configuración predeterminada
+const (
+	DefaultMaxGoroutines   = 100
+	DefaultRetryCount      = 3
+	DefaultBackoffDuration = 1 * time.Second
 )
 
 // EventBus es la interfaz para nuestro bus de eventos, definiendo los métodos básicos
@@ -26,9 +35,13 @@ type ConcreteEventBus struct {
 
 // Listener representa un suscriptor de eventos con opciones de configuración
 type Listener struct {
-	handler    func(ctx context.Context, event interface{}) error
-	errorLog   func(error)
-	middleware []Middleware
+	handler     func(ctx context.Context, event interface{}) error
+	errorLog    func(error)
+	middleware  []Middleware
+	retryCount  int
+	backoff     time.Duration
+	priority    int
+	eventFilter func(event interface{}) bool
 }
 
 // Middleware define una función que puede ejecutarse antes o después del handler
@@ -51,8 +64,27 @@ func WithMiddleware(mw Middleware) ListenerOption {
 	}
 }
 
-// DefaultMaxGoroutines es el valor predeterminado de goroutines concurrentes si no se proporciona uno
-const DefaultMaxGoroutines = 100
+// WithRetry configura el número de intentos de reintento y la duración del backoff
+func WithRetry(retryCount int, backoff time.Duration) ListenerOption {
+	return func(l *Listener) {
+		l.retryCount = retryCount
+		l.backoff = backoff
+	}
+}
+
+// WithPriority asigna una prioridad al listener
+func WithPriority(priority int) ListenerOption {
+	return func(l *Listener) {
+		l.priority = priority
+	}
+}
+
+// WithEventFilter permite definir un filtro de eventos basado en condiciones
+func WithEventFilter(filter func(event interface{}) bool) ListenerOption {
+	return func(l *Listener) {
+		l.eventFilter = filter
+	}
+}
 
 // NewEventBus crea una nueva instancia de ConcreteEventBus con maxGoroutines opcional
 func NewEventBus(maxGoroutines ...int) *ConcreteEventBus {
@@ -75,18 +107,40 @@ func (bus *ConcreteEventBus) PublishEvent(ctx context.Context, event interface{}
 	defer bus.lock.RUnlock()
 
 	if listeners, found := bus.subscribers[eventType]; found {
+		// Ordenar listeners por prioridad
+		sort.Slice(listeners, func(i, j int) bool {
+			return listeners[i].priority > listeners[j].priority
+		})
+
+		// Procesar cada listener de manera secuencial para respetar el orden de prioridad
 		for _, listener := range listeners {
-			bus.sem <- struct{}{} // Limita el número de goroutines simultáneas
-			go func(listener *Listener) {
-				defer func() { <-bus.sem }() // Libera el espacio en el semáforo
-				err := bus.invokeListener(ctx, listener, event)
-				if err != nil && listener.errorLog != nil {
-					listener.errorLog(err)
-				}
-			}(listener)
+			// Aplicar filtro de eventos
+			if listener.eventFilter != nil && !listener.eventFilter(event) {
+				continue
+			}
+			bus.handleEventWithRetry(ctx, listener, event)
 		}
 	}
 	return nil
+}
+
+// handleEventWithRetry maneja el reintento y backoff en caso de fallo de procesamiento
+func (bus *ConcreteEventBus) handleEventWithRetry(ctx context.Context, listener *Listener, event interface{}) {
+	retries := listener.retryCount
+	for retries >= 0 {
+		err := bus.invokeListener(ctx, listener, event)
+		if err == nil {
+			return // Éxito
+		}
+
+		if listener.errorLog != nil {
+			listener.errorLog(err)
+		}
+
+		// Esperar el tiempo de backoff antes de reintentar
+		time.Sleep(listener.backoff)
+		retries--
+	}
 }
 
 // Subscribe se suscribe a un tipo de evento específico con opciones de configuración
@@ -95,7 +149,10 @@ func (bus *ConcreteEventBus) Subscribe(eventType interface{}, handler func(ctx c
 	defer bus.lock.Unlock()
 
 	listener := &Listener{
-		handler: handler,
+		handler:    handler,
+		retryCount: DefaultRetryCount,
+		backoff:    DefaultBackoffDuration,
+		priority:   0,
 	}
 
 	// Aplicar opciones configurables
